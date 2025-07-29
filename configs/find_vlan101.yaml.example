@@ -1,0 +1,16 @@
+netbox:
+  object_path: "dcim.devices"
+  filters:
+    site: "mysite"
+    role:
+      - "access-switch"
+      - "core-switch"
+  repo_name_field: "name"
+
+gitlab:
+  group_path: "netconfigs"
+  file_path: "running-config.txt"
+
+search:
+  pattern: "(?:^|\\s)vlan\\s+101(?:\\s|$)"
+  ignore_case: true
