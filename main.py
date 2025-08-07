@@ -1,4 +1,5 @@
 import argparse
+import csv
 import sys
 import re
 import yaml
@@ -11,6 +12,8 @@ from custom_modules.gitlab_connector import GitLabConnector
 from custom_modules.log import logger
 from custom_modules.errors import Error
 
+
+REPORTS_DIR = Path("reports")
 
 @dataclass
 class AuditConfig:
@@ -53,6 +56,16 @@ class AuditConfig:
             )
         except Exception as e:
             raise ValueError(f"Failed to load config from {config_path}: {e}")
+
+@dataclass
+class MatchResult:
+    """Результат поиска в репозитории"""
+    repo: str
+    matches: List[str]
+
+    @property
+    def match_count(self) -> int:
+        return len(self.matches)
 
 
 class UniversalAuditor:
@@ -113,10 +126,10 @@ class UniversalAuditor:
             logger.error(f"Invalid regular expression pattern: {e}")
             return False
 
-    def search_in_configs(self) -> List[str]:
+    def search_in_configs(self) -> List[MatchResult]:
         """
         Ищет паттерн в проектах GitLab.
-        Возвращает список имен устройств, где найден паттерн.
+        Возвращает список объектов MatchResult с найденными совпадениями.
         """
         matching_objects = []
 
@@ -153,13 +166,26 @@ class UniversalAuditor:
                     logger.error(f"An error occurred for device '{repo_name}': {e}")
                     continue
 
-            if content and self.compiled_pattern.search(content):
-                logger.info(f"Pattern match found in '{repo_name}'")
-                matching_objects.append(repo_name)
+            if content:
+                # Разбиваем содержимое на строки для поиска полных строк
+                lines = content.splitlines()
+                matches = []
+                match_count = 0
+                for line in lines:
+                    if self.compiled_pattern.search(line):
+                        if match_count >= 100:  # Ограничение на количество совпадений
+                            logger.warning(f"Too many matches in '{repo_name}' (>100), truncating results")
+                            break
+                        matches.append(line)  # Убираем лишние пробелы по краям
+                        match_count += 1
+
+                if matches:
+                    logger.info(f"Pattern match found in '{repo_name}' with {len(matches)} occurrences")
+                    matching_objects.append(MatchResult(repo=repo_name, matches=matches))
 
         return matching_objects
 
-    def run_audit(self) -> List[str]:
+    def run_audit(self) -> List[MatchResult]:
         """Выполняет полный цикл аудита"""
         logger.info(f"Starting audit: {self.config.name}")
 
@@ -234,27 +260,6 @@ def load_audit_config(config_name: str) -> AuditConfig:
         raise ValueError(f"Configuration error: {e}")
 
 
-def print_audit_report(config: AuditConfig, results: List[str]) -> None:
-    """Выводит отчет о результатах аудита"""
-    print("\n" + "=" * 50)
-    print("UNIVERSAL AUDIT REPORT")
-    print("=" * 50)
-    print(f"Audit: {config.name}")
-    print(f"Description: {config.description}")
-    print(f"Search Pattern: {config.search_pattern}")
-    print("-" * 50)
-
-    if results:
-        print(f"Found {len(results)} matching objects:")
-        print()
-        for item in sorted(results):
-            print(f"  ✓ {item}")
-    else:
-        print("No matching objects found.")
-
-    print("\n" + "=" * 50 + "\n")
-
-
 def parse_arguments() -> argparse.Namespace:
     """Парсит аргументы командной строки"""
     parser = argparse.ArgumentParser(
@@ -284,8 +289,78 @@ def run_audit_workflow(config_path: str) -> None:
     auditor = UniversalAuditor(config)
     results = auditor.run_audit()
 
-    # Выводим отчет
-    print_audit_report(config, results)
+    # Извлекаем имя конфига для использования в имени CSV-файла
+    config_name = Path(config_path).stem
+
+    # Выводим отчет и сохраняем в CSV
+    generate_audit_report(config, results, config_name)
+
+
+def generate_audit_report(config: AuditConfig, results: List[MatchResult], config_name: str) -> None:
+    """Выводит отчет о результатах аудита и сохраняет в CSV"""
+    print("\n" + "=" * 50)
+    print("UNIVERSAL AUDIT REPORT")
+    print("=" * 50)
+    print(f"Audit: {config.name}")
+    print(f"Description: {config.description}")
+    print(f"Search Pattern: {config.search_pattern}")
+    print("-" * 50)
+
+    if results:
+        total_matches = sum(result.match_count for result in results)
+        print(f"Found {len(results)} matching objects with {total_matches} total matches:")
+        print()
+
+        for result in sorted(results, key=lambda x: x.repo):
+            print(f"  ✓ {result.repo} ({result.match_count} matches)")
+            # Показываем первые несколько совпадений для краткости
+            display_matches = result.matches[:3]
+            for match in display_matches:
+                # Обрезаем длинные совпадения для читаемости
+                display_match = match[:80] + "..." if len(match) > 80 else match
+                # Заменяем переводы строк на пробелы для компактности
+                display_match = display_match.replace('\n', ' ').replace('\r', ' ')
+                print(f"    - {display_match}")
+
+            if result.match_count > len(display_matches):
+                print(f"    ... and {result.match_count - len(display_matches)} more matches")
+    else:
+        print("No matching objects found.")
+
+    print("\n" + "=" * 50 + "\n")
+
+    # Создаём папку reports/ если её нет
+    REPORTS_DIR.mkdir(exist_ok=True)
+
+    # Формируем имя CSV-файла на основе имени конфига
+    csv_filename = f"{config_name}.csv"
+    csv_path = REPORTS_DIR / csv_filename
+
+    try:
+        export_to_csv(results, csv_path)
+        logger.info(f"Results exported to {csv_path}")
+        print(f"Results saved to: {csv_path}")
+    except Exception as e:
+        logger.error(f"Failed to export to CSV: {e}")
+        print(f"Warning: Failed to export to CSV: {e}")
+
+
+def export_to_csv(results: List[MatchResult], output_path: Path) -> None:
+    """Экспортирует результаты в CSV файл с разделителем ';'"""
+    with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile, delimiter=';', quoting=csv.QUOTE_MINIMAL)
+
+        # Записываем заголовки
+        writer.writerow(['Repository', 'Match_Number', 'Matched_String'])
+
+        # Записываем данные
+        for result in sorted(results, key=lambda x: x.repo):
+            for i, match in enumerate(result.matches, 1):
+                writer.writerow([
+                    result.repo,
+                    i,
+                    match,
+                ])
 
 
 def main() -> None:
